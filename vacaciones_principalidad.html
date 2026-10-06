@@ -353,7 +353,8 @@ const SEED_FERIADOS = {
 const CLAVE_DEFAULT = "Principalidad2026";
 
 const PERIODOS = [
-  { id:"2025-2026", label:"2025/2026", inicio:"2025-10-01", fin:"2026-09-30" },
+  // 2025/2026 corresponde al año 2025: desde el ingreso hasta el 31/12/2025 (corte = 1/1/2026). Quien ingresó en 2026 no tiene días en este período.
+  { id:"2025-2026", label:"2025/2026", inicio:"2025-10-01", fin:"2026-09-30", corteCalculo:"2026-01-01" },
   // Para 2026/2027 los días se calculan desde el ingreso hasta el 31/12/2026 (corte = 1/1/2027, así cuenta todo diciembre)
   { id:"2026-2027", label:"2026/2027", inicio:"2026-10-01", fin:"2027-09-30", corteCalculo:"2027-01-01" },
 ];
@@ -433,11 +434,12 @@ function desglosePorPeriodo(persona, solicitudesAprobadasPersona){
     if (hoy < perInicio) continue; // el período todavía no arrancó
     const ingreso = parseYMD(persona.ingreso);
     if (ingreso > perFin) continue; // todavía no había ingresado
+    if (per.corteCalculo && ingreso >= parseYMD(per.corteCalculo)) continue; // ingresó después del cierre del año que cubre este período
 
     const finCalculo = hoy < perFin ? hoy : perFin;
     let correspondientes;
     if (per.corteCalculo){
-      // desde el día de ingreso hasta el 31/12/2026: la escala (1 día por mes si <6 meses, luego 10/15/20) se mide a esa fecha
+      // desde el día de ingreso hasta el 31/12 del año que cubre el período: la escala (1 día por mes si <6 meses, luego 10/15/20) se mide a esa fecha
       correspondientes = persona.objetivo != null ? persona.objetivo : escalaDias(persona.ingreso, parseYMD(per.corteCalculo));
     } else if (ingreso <= perInicio){
       correspondientes = persona.objetivo != null ? persona.objetivo : escalaDias(persona.ingreso, finCalculo);
@@ -448,7 +450,7 @@ function desglosePorPeriodo(persona, solicitudesAprobadasPersona){
     }
     correspondientes = Math.max(0, Math.round(correspondientes));
 
-    out.push({ periodo: per.label, correspondientes, tomados: 0, pendientes: correspondientes });
+    out.push({ id: per.id, periodo: per.label, correspondientes, tomados: 0, pendientes: correspondientes });
   }
 
   // Los días tomados se descuentan por orden: primero se agota el período más antiguo
@@ -727,6 +729,49 @@ async function actualizarEstadoSolicitud(id, estado){
 async function guardarClave(nuevaClave){
   await update(ref(db,"config"), { clave: nuevaClave });
 }
+/* ---------- Envío automático de mails (EmailJS) ---------- */
+function emailjsConfigurado(){
+  const c = config.emailjs || {};
+  return !!(c.serviceId && c.templateId && c.publicKey);
+}
+async function enviarMailEmailJS(destinatarios, asunto, mensaje){
+  const c = config.emailjs || {};
+  const resp = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      service_id: c.serviceId,
+      template_id: c.templateId,
+      user_id: c.publicKey,
+      template_params: { to_email: destinatarios.join(","), subject: asunto, message: mensaje }
+    })
+  });
+  if (!resp.ok){
+    const txt = await resp.text();
+    throw new Error(txt || ("HTTP " + resp.status));
+  }
+}
+/** Avisa al TL (y en copia al administrador) cuando entra una solicitud. Devuelve un texto con el resultado. */
+async function notificarSolicitud(persona, tl, inicio, fin, obs){
+  const mailTL = config.mails && config.mails[slugify(tl)];
+  const copia = (config.emailjs && config.emailjs.adminMail) || "";
+  const destinatarios = [mailTL, copia].filter(x => x && x.trim()).map(x => x.trim());
+  const dias = businessDaysBetween(inicio, fin, feriadosSet());
+  const asunto = `Solicitud de vacaciones — ${persona.nombre}`;
+  const mensaje = `Hola ${tl},\n\n${persona.nombre} solicitó vacaciones.\n\nDesde: ${inicio}\nHasta: ${fin}\nDías hábiles: ${dias}\nObservaciones: ${obs || "—"}\n\nEntrá al Portal de Vacaciones (acceso administrador) para aprobar o rechazar la solicitud:\n${window.location.href.split("#")[0]}\n\nRecordá que, una vez aprobada, el asesor debe enviar la solicitud a Serial de la torre.`;
+  if (destinatarios.length === 0) return "sin_destinatario";
+  if (emailjsConfigurado()){
+    try { await enviarMailEmailJS(destinatarios, asunto, mensaje); return "enviado"; }
+    catch(err){ console.error("EmailJS:", err); return "error"; }
+  }
+  // Sin servicio de mails configurado: se abre el correo del asesor con el mensaje listo (debe apretar Enviar)
+  if (mailTL){
+    window.location.href = `mailto:${mailTL}?subject=${encodeURIComponent(asunto)}&body=${encodeURIComponent(mensaje)}`;
+    return "mailto";
+  }
+  return "sin_destinatario";
+}
+
 async function guardarMailTL(tlId, mail){
   await update(ref(db, `config/mails`), { [tlId]: mail });
 }
@@ -1015,7 +1060,7 @@ function renderTabDashboard(){
   lista.filter(p=>p.activo!==false).forEach(p=>{
     const desg = desglosePorPeriodo(p, solicitudesAprobadasDe(p.id));
     let totalPend = 0;
-    desg.forEach((d,idx)=>{ if(d.pendientes>0) pendPorPeriodo[PERIODOS[idx].id]++; totalPend+=d.pendientes; });
+    desg.forEach(d=>{ if(d.pendientes>0) pendPorPeriodo[d.id]++; totalPend+=d.pendientes; });
     if (desg.length>0 && totalPend===0) completados++;
   });
 
@@ -1322,13 +1367,28 @@ function renderTabConfig(){
     </div>
 
     <div class="card" style="padding:20px 22px; margin-bottom:18px;">
-      <h3 style="font-size:15px; margin-bottom:14px;">Mail de cada Team Leader (para el mailto automático)</h3>
+      <h3 style="font-size:15px; margin-bottom:14px;">Mail de cada Team Leader (a quién le llega el aviso)</h3>
       <form onsubmit="App.guardarMailsForm(event)">
         ${TLS.map(tl=>{
           const tlId = slugify(tl);
           return `<div class="field"><label>${tl}</label><input type="email" name="${tlId}" value="${(config.mails&&config.mails[tlId])||''}" placeholder="mail@empresa.com"></div>`;
         }).join("")}
         <button class="btn btn-primary" type="submit">Guardar mails</button>
+      </form>
+    </div>
+
+    <div class="card" style="padding:20px 22px; margin-bottom:18px;">
+      <h3 style="font-size:15px; margin-bottom:6px;">Envío automático de mails (EmailJS)</h3>
+      <p class="hint" style="margin-bottom:12px;">Con esto, cada solicitud le llega por mail al líder elegido (y en copia a tu mail) sin que nadie tenga que apretar Enviar. Completá los tres datos que te da EmailJS.</p>
+      <form onsubmit="App.guardarEmailJSForm(event)">
+        <div class="field"><label>Service ID</label><input type="text" name="serviceId" value="${(config.emailjs&&config.emailjs.serviceId)||''}" placeholder="service_xxxxxxx" autocomplete="off"></div>
+        <div class="field"><label>Template ID</label><input type="text" name="templateId" value="${(config.emailjs&&config.emailjs.templateId)||''}" placeholder="template_xxxxxxx" autocomplete="off"></div>
+        <div class="field"><label>Public Key</label><input type="text" name="publicKey" value="${(config.emailjs&&config.emailjs.publicKey)||''}" placeholder="xxxxxxxxxxxxxxx" autocomplete="off"></div>
+        <div class="field"><label>Tu mail (recibe copia de todas las solicitudes)</label><input type="email" name="adminMail" value="${(config.emailjs&&config.emailjs.adminMail)||''}" placeholder="tumail@empresa.com"></div>
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+          <button class="btn btn-primary" type="submit">Guardar</button>
+          <button class="btn btn-outline" type="button" onclick="App.probarMail()">Enviar mail de prueba</button>
+        </div>
       </form>
     </div>
 
@@ -1498,15 +1558,17 @@ const App = {
     const personaId = state.asesorSeleccionado;
     const tl = fd.get("tl"); const obs = fd.get("obs");
     await crearSolicitud({ personaId, inicio, fin, tl, obs, estado:"pendiente", origen:"asesor" });
-    toast("Solicitud enviada. Quedó pendiente de aprobación.");
     const persona = personas[personaId];
-    const mailTL = config.mails && config.mails[slugify(tl)];
-    if (mailTL){
-      const asunto = encodeURIComponent(`Solicitud de vacaciones — ${persona.nombre}`);
-      const cuerpo = encodeURIComponent(`Hola ${tl},\n\n${persona.nombre} solicita vacaciones del ${inicio} al ${fin}.\nObservaciones: ${obs||"—"}\n\nSaludos.`);
-      window.location.href = `mailto:${mailTL}?subject=${asunto}&body=${cuerpo}`;
-    }
-    e.target.reset();
+    const form = e.target;
+    const res = await notificarSolicitud(persona, tl, inicio, fin, obs);
+    const aviso = {
+      enviado: "Solicitud enviada y avisamos a tu líder por mail.",
+      mailto: "Solicitud enviada. Se abrió tu correo: apretá Enviar para avisarle a tu líder.",
+      error: "Solicitud enviada, pero no se pudo mandar el mail. Avisale a tu líder.",
+      sin_destinatario: "Solicitud enviada. Tu líder todavía no tiene mail cargado: avisale directamente."
+    }[res];
+    toast(aviso);
+    form.reset();
     render();
   },
   intentarLoginAdmin(e){
@@ -1609,6 +1671,36 @@ const App = {
     });
     toast("Persona agregada.");
     e.target.reset(); render();
+  },
+  async guardarEmailJSForm(e){
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    await update(ref(db,"config/emailjs"), {
+      serviceId: (fd.get("serviceId")||"").trim(), templateId: (fd.get("templateId")||"").trim(),
+      publicKey: (fd.get("publicKey")||"").trim(), adminMail: (fd.get("adminMail")||"").trim()
+    });
+    toast("Datos de mail guardados.");
+  },
+  async probarMail(){
+    const form = document.querySelector('form[onsubmit="App.guardarEmailJSForm(event)"]');
+    if (form){
+      const fd = new FormData(form);
+      await update(ref(db,"config/emailjs"), {
+        serviceId:(fd.get("serviceId")||"").trim(), templateId:(fd.get("templateId")||"").trim(),
+        publicKey:(fd.get("publicKey")||"").trim(), adminMail:(fd.get("adminMail")||"").trim()
+      });
+      config.emailjs = { serviceId:(fd.get("serviceId")||"").trim(), templateId:(fd.get("templateId")||"").trim(), publicKey:(fd.get("publicKey")||"").trim(), adminMail:(fd.get("adminMail")||"").trim() };
+    }
+    const destino = (config.emailjs && config.emailjs.adminMail) || "";
+    if (!emailjsConfigurado()){ toast("Completá Service ID, Template ID y Public Key."); return; }
+    if (!destino){ toast("Completá tu mail para recibir la prueba."); return; }
+    try {
+      await enviarMailEmailJS([destino], "Prueba del Portal de Vacaciones", "Si estás leyendo esto, el envío automático de mails funciona correctamente.");
+      toast("Mail de prueba enviado a " + destino);
+    } catch(err){
+      console.error(err);
+      toast("No se pudo enviar: " + String(err.message).slice(0,90));
+    }
   },
   async guardarMailsForm(e){
     e.preventDefault();
